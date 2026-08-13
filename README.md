@@ -69,3 +69,429 @@ This incident, and the fix, is the single most important engineering decision in
 - [ ] Growth/germination correlation analysis against a manual daily photo log
 - [ ] Ignition alarm pipelines for real-time overwatering/underwatering notifications
 - [ ] Local AI (RainAI) + digital-twin-gated decision layer for adaptive watering
+
+
+
+
+
+
+
+
+
+
+
+# smart-irrigate-ignition
+
+### An end-to-end, sensor-driven, closed-loop irrigation SCADA system — built from scratch, broken, debugged, and rebuilt, across hardware, industrial control software, cloud/home automation integration, and a relational data pipeline designed for future predictive modeling.
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#executive-summary)
+2. [Motivation & Goals](#motivation--goals)
+3. [System Architecture](#system-architecture)
+4. [Technology Stack](#technology-stack)
+5. [The Build Journey — Phase by Phase](#the-build-journey--phase-by-phase)
+6. [Major Incidents & Root-Cause Engineering](#major-incidents--root-cause-engineering)
+7. [The Race Condition — A Deep Dive](#the-race-condition--a-deep-dive)
+8. [Hardware Debugging Chronicle](#hardware-debugging-chronicle)
+9. [Networking & Infrastructure Saga](#networking--infrastructure-saga)
+10. [Database Engineering](#database-engineering)
+11. [Automation Logic — Full Design Rationale](#automation-logic--full-design-rationale)
+12. [Alerting & Notification System](#alerting--notification-system)
+13. [Dashboard & Visualization](#dashboard--visualization)
+14. [The Biological Side — Growing Lettuce Indoors](#the-biological-side--growing-lettuce-indoors)
+15. [Skills Demonstrated](#skills-demonstrated)
+16. [Known Limitations](#known-limitations)
+17. [Roadmap](#roadmap)
+18. [Lessons Learned](#lessons-learned)
+19. [Acknowledgments](#acknowledgments)
+
+---
+
+## Executive Summary
+
+This project began as a portfolio piece aimed at industrial automation and SCADA roles in Calgary's oil & gas sector, built during a Software Development diploma program. It evolved into a genuinely complete, multi-platform closed-loop control system: real-time dual-depth soil moisture sensing over Modbus RTU, industrial SCADA logic in Ignition, actuator control bridged through Home Assistant to a smart plug and water pump, dual-layer data logging (Ignition Tag Historian and a purpose-built PostgreSQL schema), a live Perspective HMI dashboard, and a script-based SMS/email alerting layer.
+
+Along the way, the project encountered — and resolved — a genuine production-grade race condition, multiple hardware misidentification dead-ends, a NAS infrastructure failure, database authentication issues, a failed native alarm pipeline, and two full biological growing-attempt failures rooted in real environmental engineering mistakes (oversaturation, then mold from insufficient airflow). Each failure was diagnosed to its actual root cause and corrected architecturally, not patched superficially.
+
+The system is designed from the ground up to eventually support a **digital-twin-gated AI decision layer** (a local LLM, "RainAI"), following an industrial-AI-safety pattern in which predictive actions are validated against a simulated model before being executed on real hardware.
+
+---
+
+## Motivation & Goals
+
+The original design intent was explicitly layered, mirroring how real industrial automation projects are structured:
+
+1. **Data acquisition** — physical sensors reporting real-world conditions
+2. **SCADA integration** — Ignition ingesting, historizing, and alarming on that data
+3. **Statistical modeling** — analyzing accumulated data for real patterns
+4. **Visualization** — honest, uncertainty-aware presentation of both raw and modeled data
+5. **Human insight** — a domain expert (the author) interpreting results against real theoretical constraints
+6. **AI-assisted operation** — a local AI, prompt-engineered and bounded, authorized to trigger physical actuation
+7. **Continuous improvement loop** — new data informing better decisions over time
+
+This is, in essence, a human-in-the-loop industrial control system with an LLM as the last-mile actuator candidate — deliberately built bottom-up, with trustworthy sensing and safe automation established *before* any AI involvement, rather than the reverse.
+
+---
+
+## System Architecture
+
+```
+                         +---------------------------+
+                         |  HW-390 Sensor (Shallow)   |---+
+                         +---------------------------+   |
+                                                          |  Analog (A0/A1)
+                         +---------------------------+   |
+                         |  HW-390 Sensor (Deep)      |---+
+                         +---------------------------+
+                                    |
+                                    v
+                    +-------------------------------+
+                    |  Arduino Nano (SimpleModbus    |
+                    |  Slave, dual-register, USB)    |
+                    +-------------------------------+
+                                    |  Modbus RTU (Serial, 9600 baud, 8N1)
+                                    v
+                    +-------------------------------+
+                    |  Ignition Gateway (Maker Ed.)   |
+                    |  ------------------------------ |
+                    |  - OPC UA Device Connection      |
+                    |  - Tags (Memory + OPC)           |
+                    |  - Tag Historian                 |
+                    |  - Gateway Timer Script            |
+                    |    (single-threaded polling        |
+                    |     automation engine, 1s tick)    |
+                    |  - Perspective Dashboard            |
+                    +-------------------------------+
+                          |                    |
+                          | REST/HTTP           | JDBC (PostgreSQL)
+                          v                    v
+              +-------------------+   +---------------------+
+              |  Home Assistant     |   |  PostgreSQL 18        |
+              |  (Docker, on NAS)   |   |  - moisture_readings   |
+              |  ------------------ |   |  - watering_log        |
+              |  Wemo Smart Plug    |   +---------------------+
+              |        |            |
+              |        v            |
+              |   Water Pump        |
+              +-------------------+
+
+              +-------------------+
+              |  Continuous Fan     |  (independent 5V power,
+              |  (mold/humidity     |   always-on, airflow
+              |   prevention)       |   management)
+              +-------------------+
+
+              +-------------------+
+              |  Dual Grow Lights   |  (16h/8h cycle, mirror-
+              |  + Mirror Chamber   |   assisted reflection)
+              +-------------------+
+
+              +-------------------+
+              |  Gmail SMTP ->      |  Script-based text alerts,
+              |  SMS Gateway        |  per-sensor, rate-limited
+              |  (Telus/Public      |
+              |   Mobile)           |
+              +-------------------+
+```
+
+---
+
+## Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Microcontroller | Arduino Nano (ATmega328P) |
+| Sensors | HW-390 capacitive soil moisture (x2, shallow + deep) |
+| Fieldbus Protocol | Modbus RTU (SimpleModbusSlave library) |
+| SCADA Platform | Ignition 8.3.4 (Maker Edition) |
+| SCADA Scripting | Jython 2.7 (Ignition's embedded Python) |
+| HMI | Ignition Perspective (web-based) |
+| Home Automation Bridge | Home Assistant (Docker, self-hosted) |
+| Actuator | Wemo Smart Plug (Belkin) -> 5V water pump |
+| NAS / Host | UGREEN NAS (UGOS), Docker via Portainer/Container Manager |
+| Database | PostgreSQL 18, managed via pgAdmin |
+| Notifications | Python `smtplib` -> Gmail SMTP -> carrier email-to-SMS gateway |
+| Lighting | Kullsinss LED grow light strip (full spectrum, 16H timer) |
+| Airflow | JZK 5V DC brushless fan (continuous operation) |
+| Version Control | Git / GitHub |
+| Planned AI Layer | RainAI (local LLM, Docker) |
+
+---
+
+## The Build Journey — Phase by Phase
+
+### Phase 1 — Sensor & Firmware Foundations
+Began with an HC-SR04 ultrasonic sensor and SG90 servo on a distance-triggered concept, using an Arduino Nano on a red I/O expansion shield. Debugged shield pin-labeling confusion, a servo-overheating scare from simultaneous USB+DC power, and DC adapter polarity/voltage settling (9V, center-positive). Wired and validated an SSD1306 OLED over I2C independently before combining subsystems.
+
+**Pivot:** moved from distance/servo logic to soil moisture sensing (HW-390) as a more relatable, real-world SCADA use case — irrigation. Calibrated the sensor against real dry (initially ~800/733, later re-derived) and wet (~267) reference points, achieving a working 0-100% moisture readout on the OLED, validated against real lettuce-seed soil.
+
+### Phase 2 — Modbus Integration
+Attempted a switch to Modbus RTU via `SimpleModbusSlave` and hit a genuine hardware-level conflict: the Servo library and SimpleModbusSlave both required Timer1 on the ATmega328P, causing erratic sensor/display behavior. Resolved by removing the servo from the active sketch — a clean, deliberate scope reduction rather than a hacky workaround.
+
+### Phase 3 — SCADA Onboarding
+Connected the Arduino to Ignition via a Modbus RTU Device Connection over USB serial (9600, 8N1, Slave ID 1). Built the first OPC tags, enabled Tag Historian, and began learning Ignition's tag/scripting model from the ground up.
+
+### Phase 4 — Actuation: The Smart Plug Saga
+This phase alone represents one of the most extensive troubleshooting arcs in the project:
+
+- Attempted the Wemo plug's **legacy local UPnP/XML API** directly — dead, unreachable (`:49153/setup.xml` timeout).
+- Attempted **Home Assistant's HomeKit Controller integration** — blocked by HomeKit's single-controller pairing exclusivity (the device was already claimed by Apple Home).
+- Discovered the integration-naming trap: Home Assistant had silently renamed "HomeKit Controller" to "HomeKit Device," a documented, widely-reported point of confusion.
+- Attempted `pywemo` (direct Python library, bypassing Home Assistant) — failed to even establish a socket connection, ruling out a pairing-state issue and pointing to a deeper network-level problem.
+- Diagnosed that the plug had likely never fully released its HomeKit pairing state despite appearing unpaired in Apple Home.
+- **Resolution:** relocating the plug to a different physical power outlet (likely resolving a WiFi signal-strength or fresh-DHCP-negotiation issue) allowed Home Assistant's **native legacy Wemo integration** (the actual `pywemo`-backed integration, not HomeKit at all) to successfully discover and control the device.
+- Home Assistant was deployed via Docker on a UGREEN NAS, configured through Portainer/Container Manager, with **bridge networking** initially (to avoid interfering with existing AdGuard DNS and Plex services), later switched to **host networking** specifically to enable mDNS/SSDP discovery for HomeKit-related attempts.
+
+### Phase 5 — Closing the Actuation Loop
+Wrote Ignition Gateway scripting to call Home Assistant's REST API (`/api/services/switch/turn_on` / `turn_off`) using a Long-Lived Access Token and Bearer authentication. Hit and resolved a genuine Ignition scripting gotcha: `system.net.httpPost()`'s third positional argument is `contentType`, not `headers` — silently swallowing the Authorization header and producing a misleading 401. Corrected by using explicit keyword arguments (`headerValues=`).
+
+### Phase 6 — Empirical Calibration
+Rather than guessing a watering duration, the pump's real flow rate was measured directly across 8 timed trials (~19.79 mL/sec, pooled average), and combined with an estimated container/soil volume to calculate a grounded ~3-second dose — a deliberately evidence-based engineering decision documented and later refined.
+
+### Phase 7 — The First Automation (and the Incident)
+Built the first automated watering logic as a `SoilMoisture` tag **Value Changed** script. Under real, noisy sensor conditions, this produced a genuine **race condition**: rapid, overlapping value-change events could each independently pass a stale `PumpBusy` check before any of them finished writing state, spawning multiple asynchronous 3-second watering cycles that overlapped and appeared to leave the pump "stuck on." *(Full analysis below.)*
+
+The immediate consequence was a real overwatering incident — soil moisture sustained in the 72-91% range for an extended period — which, combined with an unrelated NAS power-loss event that also disrupted Home Assistant connectivity and caused the Wemo plug's DHCP-assigned IP to drift (breaking control mid-cycle), very likely killed the first batch of germinating lettuce seeds.
+
+### Phase 8 — Architectural Redesign
+Rebuilt automation from the ground up as a **single-threaded Gateway Timer Script**, polling once per second, with zero event-driven triggers and zero spawned async threads. This structurally eliminates the possibility of overlapping executions: the pump's 3-second maximum runtime becomes a mathematically guaranteed ceiling (worst-case verified via direct calculation: a 1-second poll interval guarantees no more than exactly 3.0 seconds of pump runtime), not a best-effort assumption.
+
+### Phase 9 — Data Pipeline Engineering
+Stood up a local PostgreSQL 18 instance via pgAdmin, requiring resolution of SCRAM authentication failures and a blank-password lockout (fixed via the standard `pg_hba.conf` `trust`-mode reset procedure). Built a Gateway-Timer-driven logging pipeline inserting continuous moisture readings and discrete watering events, deliberately run in parallel with Ignition's own Tag Historian for redundancy and cross-verification.
+
+### Phase 10 — Alerting
+Built a full native Ignition **Alarm Notification Pipeline** (SMTP Notification Profile via Gmail App Password, On-Call Roster, Contact records) for threshold-based text alerts. Confirmed each individual link worked in isolation — the alarm itself correctly transitioned to Active state, SMTP sending was independently verified via a raw Python `smtplib` test — but the full pipeline-to-delivery chain never successfully sent a message end-to-end, ultimately traced in part to an incorrect contact email domain (`msg.telusmobility.com` instead of the correct `msg.telus.com`) and an apparent gap between the pipeline and its Notification block. Rather than continuing to debug Ignition's alarm subsystem indefinitely, the alerting logic was **reimplemented directly inside the Gateway Timer Script** using the same proven `smtplib` code — a pragmatic engineering trade-off, explicitly favoring working software over architectural purity.
+
+### Phase 11 — Wireless Attempt #1 and #2 (Bluetooth)
+Two separate physical Bluetooth modules, both purchased and both **sold as HC-05** (genuine Bluetooth Classic / SPP), turned out on inspection to actually be **Bluetooth Low Energy (BLE)** devices exposing GATT characteristics (`FFE1`/`FFE2`) rather than a Classic serial profile. This is a documented, real-world listing-accuracy problem in this hardware category, encountered independently twice.
+
+The first module (an AT-09/CC2541) was a genuine dead end — proper communication would have required specialized TI hardware and software (BTool, HostTest) beyond reasonable project scope.
+
+The second module was pursued further: a Windows BLE-to-serial bridge was attempted using the open-source `ble-serial` tool alongside `com0com` (a virtual COM port driver). The BLE device was successfully scanned and its MAC address identified; `com0com`'s virtual port pair was successfully created (`CNCA2` <-> `COM9`/`BLE`); but `ble-serial` consistently failed to open the resulting virtual port with a `FileNotFoundError`, even after a full system reboot — indicating a genuine driver-activation incompatibility with the specific Windows build in use, not a configuration error. This was correctly diagnosed as a legitimate engineering dead end and abandoned in favor of continued USB-tethered operation, with a **genuine Classic-mode HC-05** (verified via product listing) ordered as the correct replacement part.
+
+### Phase 12 — Dual-Sensor Expansion
+Wired a second HW-390 sensor at a deeper soil depth, added a second Modbus holding register, and performed independent dry/wet calibration for each sensor. When recalibration produced a percentage scale incompatible with historical data (a narrower raw-value range from an insufficiently rigorous "dry" reference test), the discrepancy was resolved mathematically — deriving and verifying a linear transform between the old and new calibration scales — before ultimately choosing, for practical continuity, to reuse the original sensor's historical calibration constants rather than introduce a second, incomparable percentage scale.
+
+### Phase 13 — Environmental Redesign (Growth Attempt #2)
+After the first growing attempt's failure, built a physical grow enclosure: a cardboard box lined with strategically placed mirrors (tested in multiple configurations — flat side walls, then an angled "reflector hood" above the light source, approximating commercial grow-tent reflector geometry), dual grow lights, a waterproof plastic tray base, and ventilation gaps. This second attempt also stalled — no germination after several days, and visible mold/fungal growth was discovered near the sensor probe, diagnosed as a consequence of the fully enclosed, low-airflow, highly reflective chamber trapping humidity.
+
+**Corrective redesign:** fresh (non-contaminated) soil, a continuously-running 5V DC fan for airflow (deliberately powered independently of the intermittently-connected Arduino, to guarantee 24/7 operation), and a shallower sensor repositioning to actually match the seed germination depth (previously mismatched — sensor at 2", seeds at 1/8"-1/4"). Post-fan monitoring showed the expected physical response: surface moisture reading dropped, the shallow/deep moisture gradient narrowed as expected from active airflow, and soil texture shifted from saturated to an appropriately damp "wrung-sponge" consistency.
+
+### Phase 14 — Automation Finalization
+Iteratively refined automation logic based on direct empirical observation rather than theoretical assumption — including recognizing that a fixed calendar-based watering schedule (once daily, matching an informal control-group comparison against a friend's manually-watered, sun-grown lettuce) combined with a moisture floor was more practical than a purely reactive threshold system, while retaining an independent manual **Force Automation** override capable of bypassing the automation-disable safety toggle for on-demand, fully-logged watering events. Rebuilt the PostgreSQL schema from scratch (after exporting historical data to CSV) into two clean, purpose-built tables with explicit date/time columns and per-event trigger-source notes, resolving a PostgreSQL/JDBC type-casting gotcha (`character varying` vs. `date`/`time` parameter binding) along the way.
+
+---
+
+## Major Incidents & Root-Cause Engineering
+
+| # | Incident | Root Cause | Resolution |
+|---|---|---|---|
+| 1 | Servo + Modbus Timer1 conflict | Shared hardware timer resource | Removed servo from active sketch |
+| 2 | Wemo plug unreachable | HomeKit-exclusive pairing state | Migrated to Home Assistant's native legacy Wemo integration |
+| 3 | **Pump stuck on (race condition)** | Overlapping async triggers from noisy Value-Changed events | Rebuilt as single-threaded Gateway Timer polling architecture |
+| 4 | **Overwatering incident** | Race condition + NAS power loss + DHCP IP drift | Architectural fix (above) + planned upper-bound safety monitoring |
+| 5 | PostgreSQL auth failures | SCRAM misconfiguration, blank password | Standard `pg_hba.conf` trust-mode reset |
+| 6 | Alarm pipeline silent failure | Wrong contact email domain + pipeline/block disconnect | Reimplemented alerting directly in script |
+| 7 | Two "HC-05" modules were actually BLE | Hardware listing inaccuracy (documented, recurring issue) | Diagnosed via GATT characteristic inspection; ordered verified Classic module |
+| 8 | BLE-to-serial bridge failure | Windows driver activation incompatibility (`com0com`) | Correctly identified as a genuine dead end; reverted to USB |
+| 9 | Recalibration produced incomparable data | Insufficiently rigorous dry-point reference test | Solved via linear-transform math; reused original calibration for continuity |
+| 10 | No germination, mold discovered | Enclosed, low-airflow, high-humidity chamber | Continuous independent-power fan; fresh soil; corrected sensor depth |
+| 11 | Watering log table empty after query rebuild | Named Query binding / PostgreSQL date-type casting mismatch | Explicit `::date`/`::time` casts in parameterized SQL |
+
+---
+
+## The Race Condition — A Deep Dive
+
+This is worth documenting in detail, as it is the project's single most significant piece of engineering judgment.
+
+**Original design:** a `Tag Event Script` on `SoilMoisture`'s `Value Changed` event checked a `PumpBusy` boolean tag; if `false`, it set `PumpBusy = true`, commanded the pump on, and spawned an asynchronous 3-second delayed shutoff.
+
+**The failure mode:** the Arduino's raw sensor readings were not perfectly stable — minor electrical noise produced frequent, small value fluctuations, each of which independently fired the `Value Changed` event. Because the "check `PumpBusy`, then set `PumpBusy`" sequence was not atomic, two events arriving in close succession could **both** read `PumpBusy` as `false` before either had finished writing `true` — a textbook time-of-check-to-time-of-use (TOCTOU) race condition. Each spawned its own independent asynchronous timer thread. With multiple overlapping cycles each independently trying to turn the pump on and off on staggered schedules, the pump appeared, externally, to simply never turn off.
+
+**Why the fix works structurally, not just empirically:** the replacement Gateway Timer Script runs on a single execution thread, on a fixed one-second interval, entirely decoupled from how often or how erratically the underlying sensor value changes. There is no `PumpBusy`-style check-then-set race, because there is no possibility of two overlapping executions — the automation logic only ever runs from one place, sequentially. The maximum pump runtime is not a *statistical likelihood* of staying near 3 seconds; it is a **provable upper bound**, verified via direct calculation: with a 1-second poll interval, worst-case pump runtime is exactly 3.0 seconds, full stop — because the poll interval evenly divides the target duration.
+
+---
+
+## Hardware Debugging Chronicle
+
+- Shield pin-labeling front/back confusion (HC-SR04)
+- Dual USB+DC power conflict causing servo overheating
+- DC adapter polarity/voltage determination (9V, center-positive)
+- I2C OLED address verification (0x3C vs 0x3D)
+- Timer1 resource conflict (Servo vs. Modbus)
+- Soil sensor depth/seed-depth mismatch (2" sensor vs. 1/8"-1/4" seeds)
+- Two independent BLE-mislabeled-as-Classic-Bluetooth hardware failures
+- USB upload failures traced to HC-05 wiring sharing the same TX/RX lines as the USB-to-serial chip (resolved by disconnecting Bluetooth wiring during firmware uploads)
+- A flaky USB cable initially misdiagnosed as a board failure, correctly re-diagnosed via systematic elimination (cable swap, port swap, driver update)
+- Voltage-divider design and construction (1kOhm + 2x1kOhm-in-series, breadboard-based) for safe 5V->3.3V logic-level shifting on the HC-05 RXD line
+- Dual-sensor independent calibration and a full linear-algebra reconciliation between two calibration epochs
+
+---
+
+## Networking & Infrastructure Saga
+
+- UGREEN NAS Docker deployment (Portainer / native Container Manager)
+- Bridge vs. host Docker networking trade-offs (mDNS/SSDP discovery vs. avoiding interference with AdGuard/Plex)
+- SSH access troubleshooting (host-key mismatch warnings, correct-vs-router IP confusion, Docker daemon group permissions)
+- PostgreSQL SCRAM authentication recovery via `pg_hba.conf`
+- A full NAS abrupt-power-loss recovery (Home Assistant SQLite database unclean-shutdown recovery, Docker container restart)
+- DHCP IP-address drift on both the Wemo plug (observed across three different IPs in one session) and, separately, verification steps for the NAS itself — leading directly to a stated future goal of DHCP reservations for both devices
+- Gmail SMTP App Password configuration (distinct from standard account password, requiring 2FA)
+- Carrier email-to-SMS gateway research and verification (Public Mobile routes through Telus's `msg.telus.com` domain, confirmed via direct empirical test)
+- Windows multi-Python-interpreter package installation confusion (`pip install` targeting a different interpreter than the one executing the script) — resolved via explicit full-path interpreter invocation
+
+---
+
+## Database Engineering
+
+**Schema evolution:** began with a single combined `moisture_readings` and `watering_events` table pair, iterated through a `moisture_readings_dual` intermediate design, and was ultimately purged and rebuilt (after CSV export for data preservation) into a clean, minimal two-table schema:
+
+```sql
+CREATE TABLE moisture_readings (
+    id SERIAL PRIMARY KEY,
+    reading_date DATE,
+    reading_time TIME,
+    moisture_shallow NUMERIC,
+    moisture_deep NUMERIC,
+    note TEXT
+);
+
+CREATE TABLE watering_log (
+    id SERIAL PRIMARY KEY,
+    event_date DATE,
+    event_time TIME,
+    duration_sec INTEGER,
+    estimated_ml NUMERIC,
+    moisture_shallow_before NUMERIC,
+    moisture_deep_before NUMERIC,
+    moisture_shallow_after NUMERIC,
+    moisture_deep_after NUMERIC,
+    note TEXT
+);
+```
+
+**Notable engineering decisions:**
+- Separate `DATE`/`TIME` columns (rather than a single `TIMESTAMP`) chosen deliberately for simpler downstream Excel filtering/sorting
+- A deferred-write pattern for post-dose moisture: each watering event schedules a follow-up check exactly one hour later, at which point the same row is updated in place with `moisture_shallow_after`/`moisture_deep_after` — giving a genuine before/after causal snapshot per dose, not just a point-in-time reading
+- A `note` column carrying an explicit trigger-source label (`"Scheduled Automation (12:00pm)"` vs. `"Force Automation"`), enabling later analysis to distinguish automated from manually-triggered events
+- A `0`-as-sentinel convention for sensor-unavailable readings (rather than `NULL`), chosen deliberately for straightforward filtering (`WHERE moisture_shallow_before > 0`) given the system's intermittent laptop connectivity
+- Resolution of a PostgreSQL/JDBC parameter-binding gotcha: `system.db.runPrepUpdate()` passes string parameters as `character varying` by default; inserting into `DATE`/`TIME`-typed columns required explicit `::date`/`::time` casts in the parameterized SQL text itself
+
+---
+
+## Automation Logic — Full Design Rationale
+
+The final Gateway Timer Script architecture reflects an explicit design philosophy: **safety guarantees must be structural, not statistical.**
+
+- **Single execution thread, fixed poll interval** — eliminates race conditions by construction
+- **Hard-capped dose duration** (3 seconds) — mathematically bounded, not best-effort
+- **Independent Force/Scheduled trigger paths** — `AutomationDisabled` gates only the scheduled path, allowing manual intervention (fully logged, identical safety guarantees) even while the automatic schedule is paused
+- **Sensor-quality-aware logging** — every database write checks tag quality before use, substituting a sentinel value rather than silently logging garbage or crashing
+- **Deferred causal verification** — the one-hour-later moisture check is itself implemented via the same single-threaded polling pattern (a `PendingCheckTime` tag compared against `now` on every tick), not a separate timer thread, preserving the same race-condition-free guarantee
+
+This progression — from a plausible-looking but subtly unsafe event-driven design, through a real incident, to a provably safe polling architecture — mirrors exactly the kind of judgment industrial control engineers are expected to develop, typically over a much longer timeline than this project's compressed build cycle.
+
+---
+
+## Alerting & Notification System
+
+Two independent alerting layers were built:
+
+1. **Native Ignition Alarm Pipeline** (SMTP Notification Profile, On-Call Roster, Contact records) — built to completion, individually verified at every stage, but never successfully closed the full delivery loop. Retained in the project as a demonstration of Ignition's native alarming capability and as a documented "known gap" for future resolution, rather than deleted.
+2. **Direct script-based SMTP alerting** — `smtplib`-based, triggered from `Value Changed` events on both moisture sensors independently, with a per-sensor rate-limiting cooldown (tuned iteratively from 30 minutes down to 5 minutes to 1 hour based on observed alert volume and Gmail's sending limits, empirically confirmed to be well within personal-account thresholds).
+
+---
+
+## Dashboard & Visualization
+
+Built entirely in Ignition Perspective:
+
+- Live moisture gauge (0-100%)
+- Color-coded five-zone health status label (dry / getting low / healthy / getting wet / overwatered), using nested Expression-language conditionals
+- Pump and automation status indicators with dynamic background-color bindings
+- A dual-line Time Series Chart (shallow vs. deep moisture, distinct colors) — implemented via a custom Script Transform reshaping Tag History (and later, direct PostgreSQL Named Query) datasets into the multi-series structure Perspective's chart component expects
+- A scrollable Watering Log table, bound directly to PostgreSQL via a Named Query
+- Manual override controls (Force Automation trigger button, Automation Disabled toggle)
+- Design discussions around a fully custom SVG/Coordinate-Container "live plant diagram" — a water-level-style fill gauge, positioned sensor markers, and pump-activity iconography — representing an explored but not yet fully implemented advanced Perspective visualization technique
+
+---
+
+## The Biological Side — Growing Lettuce Indoors
+
+This project treats plant biology with the same engineering rigor as the software/hardware stack, grounded in real horticultural research rather than assumption:
+
+- Germination timeline expectations (7-14 days to emergence) established from research rather than impatience-driven troubleshooting
+- Correct seed-sowing depth (1/8"-1/4") identified and reconciled against original sensor placement (2" — a genuine design flaw, corrected)
+- The "wrung-out sponge" moisture standard adopted as the practical target, replacing an initially arbitrary percentage-based threshold
+- Explicit recognition that light and water are not independent variables — water without adequate light is not merely wasted but actively counterproductive, informing the decision to prioritize verifying grow-light output (via lux measurement) as highly as moisture control
+- A deliberate day/night watering lockout, informed by the reasoning that irrigation during a plant's dark cycle serves no physiological purpose and only increases oversaturation risk
+- Two full growing-attempt failures, each diagnosed to a specific, correctable root cause (oversaturation; then mold from insufficient airflow) rather than treated as unexplained bad luck
+- An informal but methodologically honest comparison against a friend's manually-watered, naturally-sunlit control, explicitly acknowledging the confound (real sunlight vs. artificial grow light) rather than overclaiming a clean experimental comparison
+
+---
+
+## Skills Demonstrated
+
+**Ignition/SCADA:** Tags (Memory, OPC), Tag Historian (sample-mode/deadband tuning), Gateway Timer Scripts, Tag Event Scripts (built, then deliberately deprecated for sound architectural reasons), Perspective (Views, Gauge, Label, Toggle, Button, Table, Time Series Chart, Coordinate Containers, multiple binding types including Tag, Expression, Tag History in Wide/Tall/AsStored formats, Query bindings, Script Transforms), Named Queries, Database Connections (JDBC/PostgreSQL), Modbus RTU device configuration, Alarm Notification Pipelines (Profiles, Rosters, Contacts), `system.db`/`system.net`/`system.tag`/`system.date`/`system.dataset` scripting APIs.
+
+**Embedded/Hardware:** Arduino C++, analog sensor calibration, Modbus RTU slave implementation, voltage-divider circuit design, breadboard prototyping, timer-resource conflict debugging, BLE vs. Bluetooth Classic protocol distinction, serial communication debugging.
+
+**Software Engineering:** race-condition diagnosis and structural (not superficial) remediation, single-threaded-vs-async architectural trade-off reasoning, defensive scripting (quality checks, sentinel values, try/except boundaries), REST API integration (Home Assistant), SMTP email automation.
+
+**Data Engineering:** PostgreSQL schema design and iteration, SQL (DDL, DML, parameterized queries, type casting), JDBC parameter-binding gotchas, data export/preservation discipline before destructive schema changes.
+
+**Systems/Infrastructure:** Docker deployment (Portainer, Container Manager), NAS administration, SSH, DNS/DHCP troubleshooting, network diagnostics (`ping`, `ipconfig`, connection-exception root-causing), Windows driver-level troubleshooting (`com0com`), multi-Python-interpreter environment management.
+
+**Domain Knowledge:** industrial control safety patterns (structural vs. statistical guarantees), horticultural science applied to an engineered system, empirical calibration methodology (measured flow rates, linear-transform calibration reconciliation).
+
+---
+
+## Known Limitations
+
+- Currently USB-tethered to a personal laptop; genuine wireless (verified Classic HC-05) pending
+- No upper-bound moisture safety monitor yet implemented (only a lower-bound watering trigger) — identified as the single highest-priority safety gap given the overwatering incident history
+- Native Ignition Alarm Pipeline delivery chain remains unresolved
+- No remote (outside-home-network) dashboard/control access yet
+- Temperature/humidity and light-intensity sensing not yet implemented — currently inferred qualitatively rather than measured
+- No confirmed successful germination as of the current build (two prior attempts failed; a third is in progress under corrected conditions)
+
+---
+
+## Roadmap
+
+- [ ] Upper-bound moisture safety monitor with independent alerting
+- [ ] Genuine Classic-mode HC-05 wireless integration
+- [ ] ESP32 migration (native WiFi, MQTT-based communication, eliminating the serial/Bluetooth dependency entirely)
+- [ ] Ignition Gateway migration to always-on NAS hosting
+- [ ] Tailscale-based remote access
+- [ ] DHT temperature/humidity sensor integration
+- [ ] Light intensity (lux/PPFD) sensor integration
+- [ ] Daily photo-log-based growth quantification
+- [ ] UDT-based tag templating for multi-sensor scalability
+- [ ] Transaction Groups as a native-Ignition alternative to hand-rolled SQL logging
+- [ ] Statistical analysis of accumulated PostgreSQL data (moisture/watering/outcome correlation)
+- [ ] A genuine digital twin — a regression model trained on the project's own historical data, predicting outcomes before actions execute
+- [ ] RainAI integration, gated by the digital twin's predictions, following the industrial AI-safety pattern of simulation-before-action
+
+---
+
+## Lessons Learned
+
+1. **Structural safety beats statistical safety.** A system that is *usually* fine under normal conditions is not the same as a system that is *guaranteed* fine under all conditions — the race condition taught this distinction concretely, not abstractly.
+2. **Hardware listings lie, sometimes twice in a row.** Two separately-purchased "HC-05" modules were both actually BLE devices. Verifying actual protocol behavior (GATT characteristics vs. Classic SPP) mattered more than trusting product titles.
+3. **Biological systems punish impatience and reward measurement.** Both growing failures were caused by controllable environmental factors, correctly diagnosed only once actual physical checks (soil texture, mold inspection, temperature) were treated as seriously as sensor numbers.
+4. **Know when to stop.** The BLE-bridge troubleshooting session, the native Alarm Pipeline debugging, and the SSH password saga each represent moments where continued effort had genuinely diminishing returns — recognizing and stepping back from a dead end is itself an engineering skill, not a failure.
+5. **Empirical grounding beats assumption, every time.** The pump's flow rate was measured, not guessed. The watering duration was calculated, not chosen arbitrarily. The moisture thresholds were tuned against physical soil-feel checks, not held rigidly to a first-guess number. This discipline is the connective thread across the entire project.
+
+---
+
+## Acknowledgments
+
+Built as an independent portfolio project during a Software Development diploma program, targeting industrial automation and SCADA roles in Calgary's oil & gas sector. Special engineering credit to the process of debugging a live, real-world race condition affecting an actual living plant — a constraint that made every safety decision genuinely consequential rather than theoretical.
+
+---
+
+*This README documents the full engineering journey, including failures, as a deliberate choice — the diagnostic process behind each incident is considered at least as valuable, for demonstrating real engineering judgment, as the final working state of the system itself.*
