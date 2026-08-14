@@ -1,4 +1,4 @@
-# smart-irrigate-ignition
+# Smart Irrigation system using Ignition Software
 
 
 
