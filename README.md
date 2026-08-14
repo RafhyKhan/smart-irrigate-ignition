@@ -1,5 +1,6 @@
-<img width="795" height="1068" alt="Screenshot 2026-08-14 000949" src="https://github.com/user-attachments/assets/4040fd79-f071-4173-9889-3c823192ddfa" />
 
+<img width="397" height="534" alt="Screenshot 2026-08-14 000949" src="https://github.com/user-attachments/assets/4040fd79-f071-4173-9889-3c823192ddfa" />
+<img width="1434" height="847" alt="IgnitionDashboard13082026(2)" src="https://github.com/user-attachments/assets/a9610c7b-b261-49a4-a1e0-22f9c30251b4" />
 # smart-irrigate-ignition
 
 An automated, sensor-driven lettuce irrigation system built on Ignition SCADA — combining hardware sensing, industrial control logic, safety-first automation, and a data pipeline designed for future statistical and AI-driven decision-making.
